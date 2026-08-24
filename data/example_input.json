@@ -1,0 +1,12 @@
+[
+  {
+    "property_address": "123 Example St",
+    "owner_name": "Example Owner",
+    "mailing_address": "PO Box 100",
+    "mailing_differs_from_property": true,
+    "long_hold": true,
+    "equity_signal": false,
+    "distress_signal": false,
+    "source": "demo"
+  }
+]

@@ -1,18 +1,27 @@
-"""Tiny dependency-free HTTP endpoint suitable for a serverless adapter."""
-import json
-import sys
-from pathlib import Path
+"""Vercel entrypoint for the Wholesale AI Agent."""
+from typing import Any, Dict, List
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
 from qc import second_pass
 
+app = FastAPI(title="Wholesale AI Agent", version="0.1.0")
 
-def handler(request):
-    """Accept a JSON body containing {"records": [...]} and return QC output."""
-    try:
-        body = request.get_json(silent=True) if hasattr(request, "get_json") else {}
-        records = body.get("records", []) if isinstance(body, dict) else []
-        result = second_pass(records)
-        return {"status": "ok", "result": result}
-    except Exception as exc:
-        return {"status": "error", "error": str(exc)}
+
+class RunRequest(BaseModel):
+    records: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+@app.get("/api")
+def home():
+    return {
+        "service": "Wholesale AI Agent",
+        "status": "online",
+        "pipeline": "normalize -> deduplicate -> score -> second-pass QC",
+    }
+
+
+@app.post("/api/run")
+def run(request: RunRequest):
+    return {"status": "ok", "result": second_pass(request.records)}

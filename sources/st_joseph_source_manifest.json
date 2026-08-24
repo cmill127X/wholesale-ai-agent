@@ -1,0 +1,19 @@
+{
+  "county": "St. Joseph County, Indiana",
+  "primary_source": {
+    "name": "St. Joseph County Assessor Data Extract Search",
+    "url": "https://www.sjcindiana.gov/1443/Data-Extract-Search-Information",
+    "role": "parcel-layer query and property data discovery"
+  },
+  "secondary_source": {
+    "name": "St. Joseph County Auditor",
+    "url": "https://www.sjcindiana.com/auditor",
+    "role": "ownership, parcel maintenance, tax-sale context"
+  },
+  "verification_policy": {
+    "verified": "Do not label a lead verified without source evidence.",
+    "corroborated": "Prefer independent corroboration when available.",
+    "needs_review": "Missing or conflicting fields require review.",
+    "unverified": "Insufficient evidence; never present as fact."
+  }
+}

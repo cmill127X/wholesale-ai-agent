@@ -1,10 +1,4 @@
-"""Browser engine abstraction for the nationwide research agent.
-
-The production API can talk to a self-hosted browser worker through
-BROWSER_WORKER_URL. If no worker is configured, callers can continue using
-Browser Use Cloud as a fallback. This keeps browser execution independent of
-Vercel/serverless limitations and avoids cloud browser credits for normal use.
-"""
+"""Browser engine abstraction for the nationwide research agent."""
 from __future__ import annotations
 
 import os
@@ -18,7 +12,7 @@ class BrowserEngineError(RuntimeError):
 
 
 def local_browser_available() -> bool:
-    return bool(os.getenv("BROWSER_WORKER_URL"))
+    return bool(os.getenv("BROWSER_WORKER_URL") and os.getenv("BROWSER_WORKER_TOKEN"))
 
 
 def browse(
@@ -29,15 +23,11 @@ def browse(
     wait_ms: int = 1000,
     timeout_s: float = 45.0,
 ) -> Dict[str, Any]:
-    """Run deterministic browser actions on the self-hosted browser worker.
-
-    Actions are intentionally structured rather than arbitrary code. Supported
-    actions are: click, fill, select, press, scroll, wait, extract_text,
-    extract_attribute, screenshot, and goto.
-    """
+    """Run deterministic browser actions on the self-hosted browser worker."""
     worker = os.getenv("BROWSER_WORKER_URL")
-    if not worker:
-        raise BrowserEngineError("BROWSER_WORKER_URL is not configured")
+    token = os.getenv("BROWSER_WORKER_TOKEN")
+    if not worker or not token:
+        raise BrowserEngineError("BROWSER_WORKER_URL/BROWSER_WORKER_TOKEN are not configured")
 
     payload = {
         "url": url,
@@ -47,7 +37,11 @@ def browse(
     }
     try:
         with httpx.Client(timeout=timeout_s) as client:
-            response = client.post(worker.rstrip("/") + "/browse", json=payload)
+            response = client.post(
+                worker.rstrip("/") + "/browse",
+                json=payload,
+                headers={"X-Browser-Token": token},
+            )
             response.raise_for_status()
             return response.json()
     except Exception as exc:
@@ -60,10 +54,7 @@ def search_web(
     search_url: str | None = None,
     allowed_domains: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Use the self-hosted browser to run a public web search.
-
-    A configurable search URL keeps the browser engine provider-neutral.
-    """
+    """Use the self-hosted browser to run a public web search."""
     url = search_url or os.getenv("BROWSER_SEARCH_URL", "https://www.google.com/search")
     sep = "&" if "?" in url else "?"
     return browse(

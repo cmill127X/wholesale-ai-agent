@@ -14,6 +14,8 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from typing import Any, Dict, List, Optional
 
+from sources.browser_agent import search_lowtax_with_browser
+
 BASE_URL = "https://lowtaxinfo.com/lti-api/LowMobileTaxData.svc/api/PropertySearch"
 CORP_CODE = "SJC"
 CACHE_TTL_SECONDS = 15 * 60
@@ -31,15 +33,51 @@ def _get(url: str) -> Dict[str, Any]:
     return payload
 
 
+def _browser_payload(name: str, page_number: int) -> Dict[str, Any]:
+    """Fallback to Browser Use when the deterministic LowTaxInfo request fails."""
+    if page_number != 0:
+        return {"CurrentPage": 0, "MaxPage": 0, "RecordCount": 0, "Results": []}
+    records = search_lowtax_with_browser(name)
+    results: List[Dict[str, Any]] = []
+    for r in records:
+        results.append({
+            "OwnerOfRecord": r.get("owner_of_record"),
+            "PropertyAddress1": r.get("property_address"),
+            "PropertyCity": r.get("property_city"),
+            "PropertyState": r.get("property_state"),
+            "PropertyZipCode": r.get("property_zip"),
+            "MailingAddress1": r.get("mailing_address"),
+            "CurrentAccountBalance": r.get("current_account_balance"),
+            "FallBalanceDue": r.get("fall_balance_due"),
+            "FallTax": r.get("fall_tax"),
+            "SpringBalanceDue": r.get("spring_balance_due"),
+            "SpringTax": r.get("spring_tax"),
+            "PayYear": r.get("pay_year"),
+            "Status": r.get("status"),
+            "TaxType": r.get("tax_type"),
+            "DuplicateNumber": r.get("duplicate_number"),
+            "StateKey": r.get("parcel_id"),
+            "UnformattedStateKey": _norm_key(r.get("parcel_id")),
+        })
+    return {"CurrentPage": 0, "MaxPage": 0, "RecordCount": len(results), "Results": results}
+
+
 def search_owner(name: str, page_number: int = 0) -> Dict[str, Any]:
-    """Search LowTaxInfo by owner-name text with a short-lived warm cache."""
+    """Search LowTaxInfo by owner-name text with a short-lived warm cache.
+
+    Direct HTTP is the fast path. Browser Use Cloud is used only if that
+    deterministic request fails, so normal research stays fast and cheap.
+    """
     key = f"{name.strip().lower()}|{page_number}"
     cached = _CACHE.get(key)
     now = time.time()
     if cached and now - cached[0] < CACHE_TTL_SECONDS:
         return cached[1]
     params = {"CorpCode": CORP_CODE, "name": name, "page_number": page_number}
-    payload = _get(BASE_URL + "?" + urlencode(params))
+    try:
+        payload = _get(BASE_URL + "?" + urlencode(params))
+    except Exception:
+        payload = _browser_payload(name, page_number)
     _CACHE[key] = (now, payload)
     # Bound memory while retaining the most useful recent lookups.
     if len(_CACHE) > 250:

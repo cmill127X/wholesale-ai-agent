@@ -1,6 +1,7 @@
 """Live St. Joseph County parcel reader using the public ArcGIS layer."""
 from __future__ import annotations
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from typing import Any, Dict, List
@@ -27,12 +28,17 @@ def query_parcels(where: str = "1=1", limit: int = 100, offset: int = 0) -> List
     return [feature.get("attributes", {}) for feature in payload.get("features", [])]
 
 def query_parcels_pool(where: str = "1=1", pages: int = 5, page_size: int = 200) -> List[Dict[str, Any]]:
-    """Fetch a larger bounded pool for screening instead of ranking the first page only."""
+    """Fetch a bounded pool using concurrent page requests to reduce wall-clock latency."""
     if pages < 1 or pages > 5 or page_size < 1 or page_size > 1000:
         raise ValueError("pages must be 1-5 and page_size must be 1-1000")
+    offsets = [page * page_size for page in range(pages)]
+    batches = []
+    with ThreadPoolExecutor(max_workers=min(5, pages)) as pool:
+        futures = {pool.submit(query_parcels, where, page_size, offset): offset for offset in offsets}
+        for future in as_completed(futures):
+            batches.append((futures[future], future.result()))
     rows: List[Dict[str, Any]] = []
-    for page in range(pages):
-        batch = query_parcels(where=where, limit=page_size, offset=page * page_size)
+    for _, batch in sorted(batches, key=lambda item: item[0]):
         rows.extend(batch)
         if len(batch) < page_size:
             break

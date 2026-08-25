@@ -4,7 +4,7 @@ This is a prioritization model using public-record signals. It is deliberately
 not a claim that an owner is distressed or will sell.
 """
 from __future__ import annotations
-from datetime import date, datetime
+from datetime import date
 from typing import Any, Dict, List
 
 
@@ -25,11 +25,16 @@ def _year(value: Any) -> int | None:
 
 
 def _norm(value: Any) -> str:
-    return " ".join(str(value or "").lower().split())
+    return " ".join(str(value or "").lower().replace(",", " ").split())
 
 
-def _same_address(a: Any, b: Any) -> bool:
-    return _norm(a).replace(",", "") == _norm(b).replace(",", "")
+def _same_address(property_address: Any, mailing_address: Any) -> bool:
+    """Treat a mailing string that starts with the property address as the same address."""
+    prop = _norm(property_address)
+    mail = _norm(mailing_address)
+    if not prop or not mail:
+        return False
+    return prop == mail or mail.startswith(prop + " ") or prop.startswith(mail + " ")
 
 
 def strategy_score(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -40,8 +45,6 @@ def strategy_score(record: Dict[str, Any]) -> Dict[str, Any]:
     risks: List[str] = []
 
     property_address = record.get("property_address")
-    property_city = record.get("property_city")
-    property_state = record.get("property_state")
     mailing = record.get("lowtax_mailing_address") or record.get("mailing_address")
     owner = _norm(record.get("lowtax_owner_of_record") or record.get("owner_name"))
 
@@ -58,7 +61,7 @@ def strategy_score(record: Dict[str, Any]) -> Dict[str, Any]:
     # 2. Absentee ownership, confirmed by the tax-record mailing location.
     mail_text = _norm(mailing)
     prop_text = _norm(property_address)
-    if mail_text and prop_text and not _same_address(mail_text, prop_text):
+    if mail_text and prop_text and not _same_address(prop_text, mail_text):
         score += 18
         strong.append("mailing address differs from property address")
 
@@ -121,7 +124,7 @@ def strategy_score(record: Dict[str, Any]) -> Dict[str, Any]:
     if score >= 70 and strong_count < 2:
         score -= 12
         risks.append("high initial score lacked two strong independent signals; downgraded")
-    if tax_balance <= 0 and not (mail_text and prop_text and not _same_address(mail_text, prop_text)) and transfer_year and date.today().year - transfer_year < 10:
+    if tax_balance <= 0 and not (mail_text and prop_text and not _same_address(prop_text, mail_text)) and transfer_year and date.today().year - transfer_year < 10:
         score -= 8
         risks.append("few strong motivation signals")
 

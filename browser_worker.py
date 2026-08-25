@@ -3,15 +3,6 @@
 Run this on a Windows/Linux machine, VM, or small always-on server. It uses
 Playwright/Chromium directly, so browser sessions do not consume Browser Use
 Cloud credits.
-
-Install locally:
-  pip install -r requirements-browser.txt
-  playwright install chromium
-  uvicorn browser_worker:app --host 0.0.0.0 --port 8787
-
-The worker accepts structured actions rather than arbitrary Python/JS. This
-makes it safer and easier to audit while the research orchestrator decides
-which sites and actions to use.
 """
 from __future__ import annotations
 
@@ -19,7 +10,7 @@ import base64
 import os
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from playwright.sync_api import sync_playwright
 
@@ -56,13 +47,20 @@ def check_url(url: str, allowed: list[str]) -> None:
         raise HTTPException(403, "Domain is not allowed")
 
 
+def require_token(token: str | None) -> None:
+    expected = os.getenv("BROWSER_WORKER_TOKEN")
+    if not expected or not token or token != expected:
+        raise HTTPException(401, "Invalid browser worker token")
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "engine": "playwright-chromium", "self_hosted": True}
 
 
 @app.post("/browse")
-def browse(req: BrowseRequest):
+def browse(req: BrowseRequest, x_browser_token: str | None = Header(default=None)):
+    require_token(x_browser_token)
     check_url(req.url, req.allowed_domains)
     results: list[dict] = []
     headless = os.getenv("BROWSER_HEADLESS", "1") != "0"

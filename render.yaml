@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: wholesale-browser-worker
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile.browser
+    healthCheckPath: /health
+    envVars:
+      - key: BROWSER_WORKER_TOKEN
+        sync: false
+      - key: BROWSER_HEADLESS
+        value: "1"

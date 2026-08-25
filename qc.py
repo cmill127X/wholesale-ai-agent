@@ -1,18 +1,14 @@
 """Second-pass quality-control loop."""
 from __future__ import annotations
-
 from typing import Any, Dict, List
-from app import quality_control
 
 
 def second_pass(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Re-run normalization, dedupe and scoring while preserving parcel metadata."""
-    first = quality_control(records)
+    # Import lazily so app.py can import this module without a circular import.
+    from app import quality_control
 
-    # quality_control stores extra parcel fields inside Lead.metadata.
-    # Flatten that metadata back into the record before pass two so fields
-    # such as property type, city, ZIP, parcel ID and assessed values survive
-    # the second normalization/QC pass.
+    first = quality_control(records)
     second_input: List[Dict[str, Any]] = []
     for lead in first["leads"]:
         record = dict(lead)

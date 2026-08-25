@@ -1,7 +1,7 @@
 """Vercel entrypoint for the Wholesale AI Agent."""
 from __future__ import annotations
-import csv
-import io
+import csv, io, json, os, urllib.request
+from datetime import datetime
 from typing import Any, Dict, List
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
@@ -9,126 +9,112 @@ from pydantic import BaseModel, Field
 from qc import second_pass
 from sources.st_joseph_live import query_parcels_pool, to_canonical
 
-app = FastAPI(title="Wholesale AI Agent", version="0.8.0")
+app = FastAPI(title="Wholesale AI Agent", version="0.9.0")
 
 class RunRequest(BaseModel):
     records: List[Dict[str, Any]] = Field(default_factory=list)
+class ChatRequest(BaseModel):
+    message: str
+    property: Dict[str, Any] = Field(default_factory=dict)
 
-REPORT_FIELDS = ["lead_score", "lead_tier", "verification_status", "confidence", "property_address", "property_city", "property_state", "property_zip", "owner_name", "mailing_address", "last_transfer_date", "last_sale_price", "property_type", "acreage", "assessed_land_value", "assessed_improvement_value", "parcel_id", "source", "screening_reasons"]
-
+REPORT_FIELDS = ["lead_score","lead_tier","verification_status","confidence","property_address","property_city","property_state","property_zip","owner_name","mailing_address","last_transfer_date","last_sale_price","property_type","acreage","assessed_land_value","assessed_improvement_value","parcel_id","source","screening_reasons"]
 
 def _num(v: Any) -> float:
-    try:
-        return float(v or 0)
-    except Exception:
-        return 0.0
+    try: return float(v or 0)
+    except Exception: return 0.0
 
-
-def _live_result(limit: int, city: str | None, sort: str = "best", strategy: str = "all", min_score: int = 0, property_type: str = "all", owner_type: str = "all", min_years: int = 0, tax_signal: str = "all", absentee: str = "all") -> Dict[str, Any]:
+def _live_result(limit:int, city:str|None, sort:str="best", strategy:str="all", min_score:int=0, property_type:str="all", owner_type:str="all", min_years:int=0, tax_signal:str="all", absentee:str="all") -> Dict[str,Any]:
     where = "1=1"
-    if city:
-        safe_city = city.replace("'", "''")
-        where = f"PROP_CITY = '{safe_city}'"
-    pool_size = max(200, min(1000, limit * 10, 1000))
-    pages = (pool_size + 199) // 200
-    rows = query_parcels_pool(where=where, pages=pages, page_size=200)
+    if city: where = f"PROP_CITY = '{city.replace(chr(39), chr(39)*2)}'"
+    pool_size = max(200, min(1000, limit*10))
+    rows = query_parcels_pool(where=where, pages=(pool_size+199)//200, page_size=200)
     result = second_pass(to_canonical(rows))
     leads = list(result.get("leads", []))
-
-    def matches(x: Dict[str, Any]) -> bool:
+    def matches(x):
         score = _num(x.get("lead_score"))
-        if score < min_score:
-            return False
-        if property_type != "all" and str(x.get("property_type", "")).lower() != property_type.lower():
-            return False
-        if owner_type != "all" and owner_type.lower() not in str(x.get("owner_name", "")).lower():
-            return False
+        if score < min_score: return False
+        if property_type != "all" and str(x.get("property_type","")).lower() != property_type.lower(): return False
+        if owner_type != "all" and owner_type.lower() not in str(x.get("owner_name","")).lower(): return False
         reasons = " ".join(x.get("screening_reasons") or []).lower()
-        if absentee == "yes" and not any(k in reasons for k in ("absentee", "mailing", "different address")):
-            return False
-        if absentee == "no" and any(k in reasons for k in ("absentee", "different address")):
-            return False
-        if tax_signal == "balance" and _num(x.get("tax_due", x.get("tax_balance"))) <= 0:
-            return False
+        if absentee == "yes" and not any(k in reasons for k in ("absentee","mailing","different address")): return False
+        if absentee == "no" and any(k in reasons for k in ("absentee","different address")): return False
+        if tax_signal == "balance" and _num(x.get("tax_due", x.get("tax_balance"))) <= 0: return False
         if min_years:
-            # The current data model may not expose ownership years directly; use transfer date when available.
-            date = str(x.get("last_transfer_date") or "")
-            if len(date) < 4:
-                return False
             try:
-                year = int(date[:4])
-                from datetime import datetime
-                if datetime.now().year - year < min_years:
-                    return False
-            except Exception:
-                return False
-        if strategy == "hot" and score < 80:
-            return False
-        if strategy == "equity" and not (x.get("last_sale_price") or x.get("assessed_improvement_value") or x.get("assessed_land_value")):
-            return False
+                if datetime.now().year - int(str(x.get("last_transfer_date") or "")[:4]) < min_years: return False
+            except Exception: return False
+        if strategy == "hot" and score < 80: return False
+        if strategy == "equity" and not (x.get("last_sale_price") or x.get("assessed_improvement_value") or x.get("assessed_land_value")): return False
         if strategy == "longterm" and min_years == 0:
-            date = str(x.get("last_transfer_date") or "")
             try:
-                if datetime.now().year - int(date[:4]) < 15:
-                    return False
-            except Exception:
-                return False
+                if datetime.now().year - int(str(x.get("last_transfer_date") or "")[:4]) < 15: return False
+            except Exception: return False
         return True
-
     leads = [x for x in leads if matches(x)]
-    if sort == "lowest":
-        leads.sort(key=lambda x: (_num(x.get("lead_score")), -_num(x.get("confidence")), x.get("property_address", "")))
-    else:
-        leads.sort(key=lambda x: (-_num(x.get("lead_score")), -_num(x.get("confidence")), x.get("property_address", "")))
-    result["screening"] = {"pool_scanned": len(rows), "returned": min(limit, len(leads)), "method": "rank full bounded pool, apply strategy/filters, sort, then return leads", "sort": sort, "strategy": strategy}
-    result["leads"] = leads[:limit]
+    if sort == "lowest": leads.sort(key=lambda x: (_num(x.get("lead_score")), -_num(x.get("confidence")), x.get("property_address","")))
+    else: leads.sort(key=lambda x: (-_num(x.get("lead_score")), -_num(x.get("confidence")), x.get("property_address","")))
+    result["screening"]={"pool_scanned":len(rows),"returned":min(limit,len(leads)),"method":"rank -> strategy/filters -> sort -> return","sort":sort,"strategy":strategy}
+    result["leads"]=leads[:limit]
     return result
 
+def _csv_text(result):
+    out=io.StringIO(); w=csv.DictWriter(out,fieldnames=REPORT_FIELDS,extrasaction="ignore"); w.writeheader()
+    for lead in result.get("leads",[]):
+        row=dict(lead); row["screening_reasons"]="; ".join(row.get("screening_reasons") or []); w.writerow(row)
+    return out.getvalue()
 
-def _csv_text(result: Dict[str, Any]) -> str:
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=REPORT_FIELDS, extrasaction="ignore")
-    writer.writeheader()
-    for lead in result.get("leads", []):
-        row = dict(lead)
-        row["screening_reasons"] = "; ".join(row.get("screening_reasons") or [])
-        writer.writerow(row)
-    return output.getvalue()
-
+HTML = '''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Wholesale AI Agent</title><style>
+:root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--muted:#667085;--line:#e5e7eb;--blue:#2563eb;--navy:#172554;--shadow:0 12px 35px rgba(16,24,40,.08)}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1150px;margin:auto;padding:24px 16px 60px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}.brand{display:flex;gap:12px;align-items:center}.logo{width:44px;height:44px;border-radius:13px;background:var(--blue);color:#fff;display:grid;place-items:center;font-weight:900}.sub{color:var(--muted);font-size:13px}.status{color:#087443;background:#f0fdf4;border:1px solid #cfead9;border-radius:999px;padding:8px 12px;font-weight:700;font-size:13px}.hero{background:linear-gradient(135deg,var(--navy),var(--blue));color:#fff;border-radius:22px;padding:26px;box-shadow:var(--shadow)}h1{margin:0;font-size:24px}.hero h2{margin:0 0 7px;font-size:31px}.hero p{margin:0;color:#dbeafe}.strategies{display:flex;gap:8px;flex-wrap:wrap;margin-top:17px}.strategy{border:1px solid rgba(255,255,255,.35);background:rgba(255,255,255,.12);color:#fff;padding:9px 12px;border-radius:999px;font-weight:750;cursor:pointer}.strategy.active{background:#fff;color:var(--blue)}.controls{display:grid;grid-template-columns:1fr 130px 190px auto;gap:9px;margin-top:15px}.input,.select{width:100%;padding:12px;border:1px solid #d0d5dd;border-radius:10px;font-size:14px}.btn{border:0;border-radius:10px;background:#fff;color:var(--blue);font-weight:850;padding:12px 18px;cursor:pointer}.advanced{display:none;margin-top:12px;background:#fff;color:var(--ink);border-radius:14px;padding:13px;grid-template-columns:repeat(3,1fr);gap:9px}.advanced.open{display:grid}.advlabel{font-size:10px;color:var(--muted);font-weight:800;text-transform:uppercase}.advselect{width:100%;margin-top:4px;padding:9px;border:1px solid var(--line);border-radius:8px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:11px;margin:16px 0}.metric,.panel{background:var(--card);border:1px solid var(--line);border-radius:15px;box-shadow:0 5px 18px rgba(16,24,40,.04)}.metric{padding:16px}.metric .label{font-size:11px;color:var(--muted);text-transform:uppercase}.metric .num{font-size:23px;font-weight:850;margin-top:4px}.panel{padding:18px;margin-top:14px}.panel h3{margin:0 0 3px}.panel p{color:var(--muted);font-size:13px}.lead{border:1px solid var(--line);border-radius:14px;padding:15px;margin-top:9px;background:#fff;cursor:pointer;transition:.15s}.lead:hover{box-shadow:0 8px 22px rgba(16,24,40,.08);transform:translateY(-1px)}.leadhead{display:flex;justify-content:space-between;gap:10px}.address{font-weight:850}.owner{font-size:13px;color:var(--muted);margin-top:3px}.score{font-size:18px;font-weight:900;color:var(--blue)}.meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:9px}.tag{font-size:11px;padding:5px 8px;border-radius:999px;background:#f2f4f7;color:#475467}.reasons{font-size:12px;color:#475467;margin-top:9px;line-height:1.45}.empty{color:var(--muted);padding:20px 0}.actions{display:flex;gap:8px;flex-wrap:wrap}.secondary{border:1px solid var(--line);background:#fff;padding:9px 12px;border-radius:9px;font-weight:700;text-decoration:none;color:var(--ink);cursor:pointer}.modal{display:none;position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:20;padding:20px;overflow:auto}.modal.open{display:flex;align-items:center;justify-content:center}.modalcard{background:#fff;width:min(850px,100%);max-height:90vh;overflow:auto;border-radius:20px;padding:22px;box-shadow:0 25px 70px rgba(0,0,0,.25)}.modalhead{display:flex;justify-content:space-between;gap:10px}.close{border:0;background:#f2f4f7;border-radius:9px;padding:8px 11px;cursor:pointer}.detailgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:9px;margin-top:15px}.detail{border:1px solid var(--line);border-radius:10px;padding:10px}.detail b{display:block;font-size:10px;text-transform:uppercase;color:var(--muted);margin-bottom:3px}.chat{border-top:1px solid var(--line);margin-top:18px;padding-top:16px}.messages{height:230px;overflow:auto;background:#f8fafc;border-radius:12px;padding:10px}.msg{max-width:85%;padding:9px 11px;border-radius:11px;margin:6px 0;font-size:13px;line-height:1.45}.msg.user{margin-left:auto;background:#dbeafe}.msg.ai{background:#fff;border:1px solid var(--line)}.chatrow{display:flex;gap:7px;margin-top:8px}.chatrow input{flex:1;padding:11px;border:1px solid var(--line);border-radius:10px}.chatrow button{border:0;background:var(--blue);color:#fff;border-radius:10px;padding:0 16px;font-weight:800}@media(max-width:800px){.controls{grid-template-columns:1fr 1fr}.btn{grid-column:1/-1}.advanced.open{grid-template-columns:1fr 1fr}.grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:600px){.controls,.advanced.open{grid-template-columns:1fr}.grid{grid-template-columns:1fr 1fr}.status{display:none}.hero h2{font-size:26px}.detailgrid{grid-template-columns:1fr}}</style></head><body><main class="wrap">
+<header class="top"><div class="brand"><div class="logo">W</div><div><h1>Wholesale AI Agent</h1><div class="sub">Research • Verify • Score • QC</div></div></div><div class="status">● System online</div></header>
+<section class="hero"><h2>Find better wholesale leads.</h2><p>Research public parcel data, inspect the property, and ask the agent about any lead.</p><div class="strategies"><button class="strategy active" data-s="all" onclick="setStrategy('all')">All Leads</button><button class="strategy" data-s="hot" onclick="setStrategy('hot')">🔥 Hot Wholesale</button><button class="strategy" data-s="equity" onclick="setStrategy('equity')">💰 High Equity</button><button class="strategy" data-s="longterm" onclick="setStrategy('longterm')">🏠 Long-Term</button><button class="strategy" onclick="document.getElementById('advanced').classList.toggle('open')">⚙ Advanced Filters</button></div><div class="controls"><input id="city" class="input" value="South Bend" placeholder="City (optional)"><select id="limit" class="select"><option>10</option><option selected>25</option><option>50</option><option>100</option></select><select id="sort" class="select"><option value="best">Best lead score → lowest</option><option value="lowest">Lowest lead score → highest</option></select><button class="btn" onclick="runSearch()">Run Research</button></div><div id="advanced" class="advanced"><label><span class="advlabel">Minimum score</span><select id="minScore" class="advselect"><option value="0">Any</option><option>60</option><option>70</option><option>80</option><option>90</option></select></label><label><span class="advlabel">Ownership length</span><select id="minYears" class="advselect"><option>0</option><option>10</option><option>15</option><option>20</option></select></label><label><span class="advlabel">Property type</span><select id="propertyType" class="advselect"><option value="all">Any</option><option>single family</option><option>multifamily</option><option>duplex</option><option>condo</option><option>vacant land</option></select></label><label><span class="advlabel">Owner structure</span><select id="ownerType" class="advselect"><option value="all">Any</option><option>trust</option><option>llc</option><option>estate</option><option>life estate</option></select></label><label><span class="advlabel">Absentee</span><select id="absentee" class="advselect"><option>all</option><option>yes</option><option>no</option></select></label><label><span class="advlabel">Tax signal</span><select id="taxSignal" class="advselect"><option>all</option><option value="balance">Tax balance present</option></select></label></div></section>
+<section class="grid"><div class="metric"><div class="label">Pipeline</div><div class="num">2-pass QC</div></div><div class="metric"><div class="label">Source</div><div class="num">Public GIS</div></div><div class="metric"><div class="label">Mode</div><div class="num">Zero-cost</div></div><div class="metric"><div class="label">Output</div><div class="num">Ranked</div></div></section><section class="panel"><h3>Quick access</h3><p>Run a fresh screen or download the current ranked report.</p><div class="actions"><a id="apiLink" class="secondary">View API results</a><a id="csvLink" class="secondary">Download CSV</a><button class="secondary" onclick="openChat()">💬 Chat with Agent</button></div></section><section class="panel"><h3>Research results</h3><p id="summary">Run research to see ranked properties. Click any property for full available details.</p><div id="results"><div class="empty">Nothing scanned yet.</div></div></section></main>
+<div id="modal" class="modal" onclick="if(event.target===this)closeModal()"><div class="modalcard"><div class="modalhead"><div><h2 id="dtitle" style="margin:0"></h2><div id="downer" class="owner"></div></div><button class="close" onclick="closeModal()">Close</button></div><div id="details" class="detailgrid"></div><div class="chat"><h3 style="margin:0 0 8px">Ask the Wholesale AI Agent</h3><div id="messages" class="messages"><div class="msg ai">Ask me why this property ranked, what to verify, what the ownership history suggests, or what I would investigate next.</div></div><div class="chatrow"><input id="chatInput" placeholder="Ask about this property…" onkeydown="if(event.key==='Enter')sendChat()"><button onclick="sendChat()">Send</button></div></div></div></div><div id="globalChat" class="modal" onclick="if(event.target===this)closeGlobalChat()"><div class="modalcard"><div class="modalhead"><h2 style="margin:0">Wholesale AI Agent</h2><button class="close" onclick="closeGlobalChat()">Close</button></div><div id="globalMessages" class="messages" style="height:420px"><div class="msg ai">I'm ready. Ask me about the screening process, filters, a property, or what we should investigate next.</div></div><div class="chatrow"><input id="globalInput" placeholder="Ask the agent…" onkeydown="if(event.key==='Enter')sendGlobalChat()"><button onclick="sendGlobalChat()">Send</button></div></div></div>
+<script>
+let strategy='all',currentProperty={};const esc=v=>String(v??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));function setStrategy(s){strategy=s;document.querySelectorAll('.strategy[data-s]').forEach(b=>b.classList.toggle('active',b.dataset.s===s))}function qs(){let p=new URLSearchParams({limit:document.getElementById('limit').value,sort:document.getElementById('sort').value,strategy,min_score:document.getElementById('minScore').value,min_years:document.getElementById('minYears').value,property_type:document.getElementById('propertyType').value,owner_type:document.getElementById('ownerType').value,absentee:document.getElementById('absentee').value,tax_signal:document.getElementById('taxSignal').value});let c=document.getElementById('city').value.trim();if(c)p.set('city',c);return p}async function runSearch(){const box=document.getElementById('results'),summary=document.getElementById('summary');box.innerHTML='<div class="empty">Research in progress…</div>';summary.textContent='Scanning public parcel data and running QC…';let p=qs();document.getElementById('apiLink').href='/api/live-leads?'+p;document.getElementById('csvLink').href='/api/report.csv?'+p;try{let r=await fetch('/api/live-leads?'+p),d=await r.json();if(d.status!=='ok')throw Error(d.error||'Research failed');let leads=d.result?.leads||[];summary.textContent=`Scanned ${d.result?.screening?.pool_scanned||0} records • ${leads.length} leads`;box.innerHTML=leads.length?leads.map((x,i)=>`<article class="lead" onclick='openProperty(${JSON.stringify(x).replace(/'/g,"&#39;")})'><div class="leadhead"><div><div class="address">${i+1}. ${esc(x.property_address||'Unknown address')}</div><div class="owner">${esc(x.owner_name||'Unknown owner')}</div></div><div class="score">${esc(x.lead_score||0)}/100</div></div><div class="meta"><span class="tag">Tier ${esc(x.lead_tier||'C')}</span><span class="tag">${esc(x.verification_status||'unverified')}</span>${x.property_type?`<span class="tag">${esc(x.property_type)}</span>`:''}${x.last_transfer_date?`<span class="tag">Transfer ${esc(x.last_transfer_date)}</span>`:''}</div><div class="reasons">${esc((x.screening_reasons||[]).join(' • ')||'No reasons recorded.')}</div></article>`).join(''):'<div class="empty">No leads matched those filters.</div>'}catch(e){summary.textContent='Research failed';box.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}function openProperty(x){currentProperty=x;document.getElementById('dtitle').textContent=x.property_address||'Property';document.getElementById('downer').textContent=x.owner_name||'Unknown owner';let fields=[['Lead score',x.lead_score],['Tier',x.lead_tier],['Verification',x.verification_status],['Confidence',x.confidence],['Property type',x.property_type],['Parcel ID',x.parcel_id],['City',x.property_city],['State',x.property_state],['ZIP',x.property_zip],['Mailing address',x.mailing_address],['Last transfer',x.last_transfer_date],['Last sale price',x.last_sale_price],['Acreage',x.acreage],['Assessed land',x.assessed_land_value],['Assessed improvements',x.assessed_improvement_value],['Tax due',x.tax_due||x.tax_balance],['Source',x.source],['Screening reasons',(x.screening_reasons||[]).join(' • ')]];document.getElementById('details').innerHTML=fields.map(([k,v])=>`<div class="detail"><b>${esc(k)}</b>${esc(v??'Not available')}</div>`).join('');document.getElementById('messages').innerHTML='<div class="msg ai">Property loaded. Ask me anything about this lead.</div>';document.getElementById('modal').classList.add('open')}function closeModal(){document.getElementById('modal').classList.remove('open')}function openChat(){document.getElementById('globalChat').classList.add('open')}function closeGlobalChat(){document.getElementById('globalChat').classList.remove('open')}async function sendChat(){let i=document.getElementById('chatInput'),m=i.value.trim();if(!m)return;addMsg('messages',m,'user');i.value='';let r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m,property:currentProperty})}),d=await r.json();addMsg('messages',d.answer||'I could not answer that yet.','ai')}async function sendGlobalChat(){let i=document.getElementById('globalInput'),m=i.value.trim();if(!m)return;addMsg('globalMessages',m,'user');i.value='';let r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m,property:{}})}),d=await r.json();addMsg('globalMessages',d.answer||'I could not answer that yet.','ai')}function addMsg(id,text,who){let box=document.getElementById(id),d=document.createElement('div');d.className='msg '+who;d.textContent=text;box.appendChild(d);box.scrollTop=box.scrollHeight}
+</script></body></html>'''
 
 @app.get("/", response_class=HTMLResponse)
-def landing():
-    return """<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Wholesale AI Agent</title><style>
-:root{--bg:#f6f7fb;--card:#fff;--ink:#172033;--muted:#667085;--line:#e5e7eb;--accent:#2563eb;--accent2:#1d4ed8;--good:#087443;--shadow:0 12px 35px rgba(16,24,40,.08)}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1100px;margin:auto;padding:28px 18px 60px}.top{display:flex;justify-content:space-between;align-items:center;gap:18px;margin-bottom:28px}.brand{display:flex;align-items:center;gap:12px}.logo{width:42px;height:42px;border-radius:12px;background:var(--accent);color:#fff;display:grid;place-items:center;font-weight:800;box-shadow:0 8px 18px rgba(37,99,235,.25)}h1{font-size:24px;margin:0}.sub{color:var(--muted);font-size:13px;margin-top:3px}.status{display:flex;align-items:center;gap:7px;padding:8px 12px;border:1px solid #cfead9;background:#f0fdf4;color:var(--good);border-radius:999px;font-size:13px;font-weight:700}.dot{width:8px;height:8px;border-radius:50%;background:#16a34a}.hero{background:linear-gradient(135deg,#172554,#2563eb);color:#fff;border-radius:22px;padding:30px;box-shadow:var(--shadow);margin-bottom:20px}.hero h2{font-size:32px;line-height:1.1;margin:0 0 9px}.hero p{max-width:720px;margin:0;color:#dbeafe;line-height:1.55}.controls{margin-top:24px;display:grid;grid-template-columns:1fr 150px 190px auto;gap:10px}.input,.select{width:100%;padding:13px 14px;border-radius:11px;border:1px solid rgba(255,255,255,.25);background:#fff;color:var(--ink);font-size:15px}.btn{border:0;border-radius:11px;padding:13px 18px;font-weight:800;cursor:pointer;background:#fff;color:var(--accent2);font-size:15px}.btn:hover{transform:translateY(-1px)}.strategies{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}.strategy{border:1px solid rgba(255,255,255,.35);background:rgba(255,255,255,.12);color:#fff;padding:9px 12px;border-radius:999px;font-weight:700;cursor:pointer}.strategy.active{background:#fff;color:var(--accent2)}.advanced{margin-top:14px;background:#fff;color:var(--ink);border-radius:14px;padding:14px;display:none}.advanced.open{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.advlabel{font-size:11px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.05em}.advselect{margin-top:5px;width:100%;padding:10px;border:1px solid var(--line);border-radius:9px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}.metric,.panel{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:0 5px 18px rgba(16,24,40,.04)}.metric{padding:18px}.metric .label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em}.metric .num{font-size:25px;font-weight:800;margin-top:5px}.panel{padding:20px}.panel h3{margin:0 0 4px;font-size:18px}.panel p{color:var(--muted);margin:0 0 16px;font-size:13px}.actions{display:flex;gap:8px;flex-wrap:wrap}.secondary{display:inline-block;text-decoration:none;color:var(--ink);background:#fff;border:1px solid var(--line);padding:10px 13px;border-radius:10px;font-weight:700;font-size:14px}.results{margin-top:18px}.lead{border:1px solid var(--line);border-radius:14px;padding:16px;margin-top:10px;background:#fff}.leadhead{display:flex;justify-content:space-between;gap:10px}.address{font-weight:800}.owner{color:var(--muted);font-size:13px;margin-top:3px}.score{font-weight:900;color:var(--accent);font-size:18px}.meta{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.tag{font-size:12px;padding:5px 8px;border-radius:999px;background:#f2f4f7;color:#475467}.reasons{color:#475467;font-size:12px;margin-top:10px;line-height:1.5}.empty{color:var(--muted);padding:20px 0}.foot{color:#98a2b3;text-align:center;font-size:12px;margin-top:28px}@media(max-width:820px){.controls{grid-template-columns:1fr 1fr}.btn{grid-column:1/-1}.advanced.open{grid-template-columns:1fr 1fr}}@media(max-width:720px){.top{align-items:flex-start}.status{display:none}.hero{padding:23px;border-radius:18px}.hero h2{font-size:27px}.controls{grid-template-columns:1fr}.btn{grid-column:auto}.grid{grid-template-columns:repeat(2,1fr)}.advanced.open{grid-template-columns:1fr}.leadhead{align-items:flex-start}.wrap{padding:20px 14px 45px}}
-</style></head><body><main class='wrap'><header class='top'><div class='brand'><div class='logo'>W</div><div><h1>Wholesale AI Agent</h1><div class='sub'>Research • Verify • Score • QC</div></div></div><div class='status'><span class='dot'></span> System online</div></header>
-<section class='hero'><h2>Find better wholesale leads.</h2><p>Choose a strategy, tune the filters, and run a second-pass quality check before a lead reaches your list.</p><div class='strategies'><button class='strategy active' data-strategy='all' onclick='setStrategy("all")'>All Leads</button><button class='strategy' data-strategy='hot' onclick='setStrategy("hot")'>🔥 Hot Wholesale</button><button class='strategy' data-strategy='equity' onclick='setStrategy("equity")'>💰 High Equity Signals</button><button class='strategy' data-strategy='longterm' onclick='setStrategy("longterm")'>🏠 Long-Term Owner</button><button class='strategy' onclick='toggleAdvanced()'>⚙ Advanced Filters</button></div><div class='controls'><input id='city' class='input' value='South Bend' placeholder='City (optional)'><select id='limit' class='select'><option value='10'>Top 10</option><option value='25' selected>Top 25</option><option value='50'>Top 50</option><option value='100'>Top 100</option></select><select id='sort' class='select'><option value='best' selected>Best lead score → lowest</option><option value='lowest'>Lowest lead score → highest</option></select><button class='btn' onclick='runSearch()'>Run Research</button></div><div id='advanced' class='advanced'><label><span class='advlabel'>Minimum score</span><select id='minScore' class='advselect'><option value='0'>Any</option><option value='60'>60+</option><option value='70'>70+</option><option value='80'>80+</option><option value='90'>90+</option></select></label><label><span class='advlabel'>Ownership length</span><select id='minYears' class='advselect'><option value='0'>Any</option><option value='10'>10+ years</option><option value='15'>15+ years</option><option value='20'>20+ years</option></select></label><label><span class='advlabel'>Property type</span><select id='propertyType' class='advselect'><option value='all'>Any</option><option value='single family'>Single Family</option><option value='multifamily'>Multifamily</option><option value='duplex'>Duplex</option><option value='condo'>Condo</option><option value='vacant land'>Vacant Land</option></select></label><label><span class='advlabel'>Owner</span><select id='ownerType' class='advselect'><option value='all'>Any</option><option value='trust'>Trust</option><option value='llc'>LLC / Company</option><option value='estate'>Estate</option><option value='life estate'>Life Estate</option></select></label><label><span class='advlabel'>Absentee</span><select id='absentee' class='advselect'><option value='all'>Any</option><option value='yes'>Absentee only</option><option value='no'>Owner occupied signal</option></select></label><label><span class='advlabel'>Tax signal</span><select id='taxSignal' class='advselect'><option value='all'>Any</option><option value='balance'>Tax balance present</option></select></label></div></section>
-<section class='grid'><div class='metric'><div class='label'>Pipeline</div><div class='num'>2-pass QC</div></div><div class='metric'><div class='label'>Source</div><div class='num'>Public GIS</div></div><div class='metric'><div class='label'>Mode</div><div class='num'>Zero-cost</div></div><div class='metric'><div class='label'>Output</div><div class='num'>Ranked</div></div></section>
-<section class='panel'><h3>Quick access</h3><p>Run a fresh screen or download a ranked report.</p><div class='actions'><a id='apiLink' class='secondary' href='/api/live-leads?limit=25&city=South%20Bend&sort=best'>View API results</a><a id='csvLink' class='secondary' href='/api/report.csv?limit=25&city=South%20Bend&sort=best'>Download CSV</a><a class='secondary' href='/api'>System status</a></div></section>
-<section class='panel results'><h3>Research results</h3><p id='summary'>Run research to see ranked properties.</p><div id='results'><div class='empty'>Nothing scanned yet.</div></div></section><div class='foot'>Wholesale AI Agent • public-data screening only • every lead requires verification</div></main>
-<script>
-let strategy='all';function esc(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]))}function setStrategy(s){strategy=s;document.querySelectorAll('.strategy[data-strategy]').forEach(b=>b.classList.toggle('active',b.dataset.strategy===s))}function toggleAdvanced(){document.getElementById('advanced').classList.toggle('open')}
-function params(){const city=document.getElementById('city').value.trim(),limit=document.getElementById('limit').value,sort=document.getElementById('sort').value;return `limit=${encodeURIComponent(limit)}&sort=${encodeURIComponent(sort)}&strategy=${encodeURIComponent(strategy)}&min_score=${document.getElementById('minScore').value}&min_years=${document.getElementById('minYears').value}&property_type=${encodeURIComponent(document.getElementById('propertyType').value)}&owner_type=${encodeURIComponent(document.getElementById('ownerType').value)}&absentee=${document.getElementById('absentee').value}&tax_signal=${document.getElementById('taxSignal').value}`+(city?'&city='+encodeURIComponent(city):'')}
-async function runSearch(){const summary=document.getElementById('summary'),box=document.getElementById('results');summary.textContent='Scanning public parcel data and running QC…';box.innerHTML='<div class="empty">Research in progress…</div>';const p=params();document.getElementById('apiLink').href='/api/live-leads?'+p;document.getElementById('csvLink').href='/api/report.csv?'+p;try{const r=await fetch('/api/live-leads?'+p),data=await r.json();if(data.status!=='ok')throw new Error(data.error||'Research failed');const result=data.result||{},leads=result.leads||[];summary.textContent=`Scanned ${result.screening?.pool_scanned??0} records • ${leads.length} leads • ${strategy==='all'?'all leads':strategy}`;if(!leads.length){box.innerHTML='<div class="empty">No leads matched those filters.</div>';return}box.innerHTML=leads.map((x,i)=>`<article class="lead"><div class="leadhead"><div><div class="address">${i+1}. ${esc(x.property_address||'Unknown address')}</div><div class="owner">${esc(x.owner_name||'Unknown owner')}</div></div><div class="score">${esc(x.lead_score??0)}/100</div></div><div class="meta"><span class="tag">Tier ${esc(x.lead_tier||'C')}</span><span class="tag">${esc(x.verification_status||'unverified')}</span>${x.last_transfer_date?`<span class="tag">Transfer ${esc(x.last_transfer_date)}</span>`:''}${x.property_type?`<span class="tag">${esc(x.property_type)}</span>`:''}</div><div class="reasons">${esc((x.screening_reasons||[]).join(' • ')||'No screening reasons recorded.')}</div></article>`).join('')}catch(e){summary.textContent='Research failed';box.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
-</script></body></html>"""
+def landing(): return HTML
 
 @app.get("/api")
-def home():
-    return {"service":"Wholesale AI Agent","status":"online","pipeline":"public parcel research -> larger pool -> rank -> strategy filters -> second-pass QC -> CSV report"}
+def home(): return {"service":"Wholesale AI Agent","status":"online","version":"0.9.0","pipeline":"public parcel research -> strategy filters -> second-pass QC -> property details -> agent chat"}
 
 @app.post("/api/run")
-def run(request: RunRequest):
-    return {"status":"ok","result":second_pass(request.records)}
+def run(request:RunRequest): return {"status":"ok","result":second_pass(request.records)}
 
 @app.get("/api/live-leads")
 def live_leads(limit:int=Query(25,ge=1,le=100),city:str|None=Query(None,max_length=40),sort:str=Query("best",pattern="^(best|lowest)$"),strategy:str=Query("all",pattern="^(all|hot|equity|longterm)$"),min_score:int=Query(0,ge=0,le=100),property_type:str=Query("all",max_length=40),owner_type:str=Query("all",max_length=40),min_years:int=Query(0,ge=0,le=100),tax_signal:str=Query("all",max_length=20),absentee:str=Query("all",max_length=10)):
-    try:
-        return {"status":"ok","source":"South Bend/St. Joseph County public ArcGIS parcel layer","query":{"city":city,"limit":limit,"sort":sort,"strategy":strategy},"result":_live_result(limit,city,sort,strategy,min_score,property_type,owner_type,min_years,tax_signal,absentee)}
-    except Exception as exc:
-        return {"status":"error","error":str(exc),"hint":"The public GIS service may be temporarily unavailable."}
+    try: return {"status":"ok","source":"South Bend/St. Joseph County public ArcGIS parcel layer","query":{"city":city,"limit":limit,"sort":sort,"strategy":strategy},"result":_live_result(limit,city,sort,strategy,min_score,property_type,owner_type,min_years,tax_signal,absentee)}
+    except Exception as exc: return {"status":"error","error":str(exc),"hint":"The public GIS service may be temporarily unavailable."}
 
 @app.get("/api/report.csv")
 def report_csv(limit:int=Query(25,ge=1,le=100),city:str|None=Query(None,max_length=40),sort:str=Query("best",pattern="^(best|lowest)$"),strategy:str=Query("all",pattern="^(all|hot|equity|longterm)$"),min_score:int=Query(0,ge=0,le=100),property_type:str=Query("all",max_length=40),owner_type:str=Query("all",max_length=40),min_years:int=Query(0,ge=0,le=100),tax_signal:str=Query("all",max_length=20),absentee:str=Query("all",max_length=10)):
     try:
-        result=_live_result(limit,city,sort,strategy,min_score,property_type,owner_type,min_years,tax_signal,absentee);content=_csv_text(result);filename=f"wholesale_leads_{(city or 'st_joseph_county').lower().replace(' ','_')}_{limit}_{strategy}.csv";return StreamingResponse(io.BytesIO(content.encode('utf-8')),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':f'attachment; filename="{filename}"'})
-    except Exception as exc:
-        return PlainTextResponse(f"Report generation failed: {exc}",status_code=502)
+        result=_live_result(limit,city,sort,strategy,min_score,property_type,owner_type,min_years,tax_signal,absentee);content=_csv_text(result);filename=f"wholesale_leads_{(city or 'st_joseph_county').lower().replace(' ','_')}_{limit}_{strategy}.csv";return StreamingResponse(io.BytesIO(content.encode()),media_type="text/csv; charset=utf-8",headers={"Content-Disposition":f'attachment; filename="{filename}"'})
+    except Exception as exc: return PlainTextResponse(f"Report generation failed: {exc}",status_code=502)
+
+def _local_chat(message:str, prop:dict)->str:
+    q=message.lower();addr=prop.get("property_address") or "this property";score=prop.get("lead_score")
+    if not prop:
+        if "filter" in q or "strategy" in q: return "Use Hot Wholesale, High Equity, Long-Term Owner, or Advanced Filters. I can help decide which screen fits your strategy."
+        if "test" in q: return "For the first blind test, use fresh properties the agent has not seen in the 10-property training set, then compare its ranking to your manual judgment."
+        return "I can explain the scoring, filters, QC process, or help plan the next research run. Ask me what you want to know."
+    if any(k in q for k in ("why","score","rank")): return f"{addr} is currently scored {score}/100. The ranking uses the available parcel signals and second-pass QC. The screening reasons on the property card are the signals to verify."
+    if any(k in q for k in ("transfer","sale","history")): return f"The available last-transfer information for {addr} is {prop.get('last_transfer_date') or 'not available'}, with recorded sale price {prop.get('last_sale_price') or 'not available'}. A transfer after a death is an important negative signal, so verify the deed history before outreach."
+    if "owner" in q: return f"The parcel record currently identifies {prop.get('owner_name') or 'an unknown owner'} and the mailing address is {prop.get('mailing_address') or 'not available'}. The record alone does not establish who has authority to sell."
+    if any(k in q for k in ("next","verify")): return "Next I would verify the exact owner identity, latest deed/transfer, current listing status, and—when we add it—MyCase estate/probate records. Treat the lead score as a screening signal, not proof of seller motivation or authority."
+    return f"I can analyze {addr} using the property fields currently available. Ask me about its score, ownership, transfer history, property characteristics, or what we should verify next."
+
+@app.post("/api/chat")
+def chat(request:ChatRequest):
+    api_key=os.getenv("OPENAI_API_KEY")
+    if api_key:
+        try:
+            model=os.getenv("OPENAI_MODEL","gpt-4.1-mini")
+            system=("You are the Wholesale AI Agent. Analyze public property-screening data for real-estate wholesale research. Be precise. Never claim a deceased person's heirs have authority to sell without verification. Explain uncertainty and recommend title/court verification when appropriate. Property context: "+json.dumps(request.property,default=str))
+            payload=json.dumps({"model":model,"messages":[{"role":"system","content":system},{"role":"user","content":request.message}],"temperature":0.2}).encode()
+            req=urllib.request.Request("https://api.openai.com/v1/chat/completions",data=payload,headers={"Authorization":"Bearer "+api_key,"Content-Type":"application/json"})
+            with urllib.request.urlopen(req,timeout=25) as resp: data=json.loads(resp.read().decode())
+            return {"status":"ok","answer":data["choices"][0]["message"]["content"],"mode":"llm"}
+        except Exception: pass
+    return {"status":"ok","answer":_local_chat(request.message,request.property),"mode":"local-agent"}

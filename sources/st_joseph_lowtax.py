@@ -1,22 +1,28 @@
 """St. Joseph County LowTaxInfo public API adapter.
 
-The endpoint returns paginated JSON records from LowTaxInfo.  We use the
-owner-name search as the discovery mechanism and then join records back to
-GIS parcels using StateKey/UnformattedStateKey when possible.
+The endpoint returns paginated JSON records from LowTaxInfo. We use the
+owner-name search as the discovery mechanism and join records back to GIS
+parcels using StateKey/UnformattedStateKey when possible.
+
+The adapter keeps a small process-local cache so repeated research runs do
+not re-query the same owner names during a warm server instance.
 """
 from __future__ import annotations
 import json
+import time
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from typing import Any, Dict, List, Optional
 
 BASE_URL = "https://lowtaxinfo.com/lti-api/LowMobileTaxData.svc/api/PropertySearch"
 CORP_CODE = "SJC"
+CACHE_TTL_SECONDS = 15 * 60
+_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
 
 
 def _get(url: str) -> Dict[str, Any]:
     request = Request(url, headers={"User-Agent": "wholesale-ai-agent/1.0", "Accept": "application/json"})
-    with urlopen(request, timeout=25) as response:
+    with urlopen(request, timeout=12) as response:
         payload = json.loads(response.read().decode("utf-8-sig"))
     if not isinstance(payload, dict):
         raise RuntimeError("LowTaxInfo returned a non-object response")
@@ -26,9 +32,21 @@ def _get(url: str) -> Dict[str, Any]:
 
 
 def search_owner(name: str, page_number: int = 0) -> Dict[str, Any]:
-    """Search LowTaxInfo by owner-name text."""
+    """Search LowTaxInfo by owner-name text with a short-lived warm cache."""
+    key = f"{name.strip().lower()}|{page_number}"
+    cached = _CACHE.get(key)
+    now = time.time()
+    if cached and now - cached[0] < CACHE_TTL_SECONDS:
+        return cached[1]
     params = {"CorpCode": CORP_CODE, "name": name, "page_number": page_number}
-    return _get(BASE_URL + "?" + urlencode(params))
+    payload = _get(BASE_URL + "?" + urlencode(params))
+    _CACHE[key] = (now, payload)
+    # Bound memory while retaining the most useful recent lookups.
+    if len(_CACHE) > 250:
+        oldest = sorted(_CACHE.items(), key=lambda item: item[1][0])[:50]
+        for old_key, _ in oldest:
+            _CACHE.pop(old_key, None)
+    return payload
 
 
 def search_owner_all_pages(name: str, max_pages: int = 90) -> List[Dict[str, Any]]:

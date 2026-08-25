@@ -1,6 +1,7 @@
 from __future__ import annotations
 import csv, io, re
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
@@ -24,25 +25,33 @@ def owner_search_name(owner:str)->str:
     parts=re.findall(r"[A-Za-z][A-Za-z'-]+", owner or "")
     return " ".join(parts[:2]) if len(parts)>=2 else (parts[0] if parts else "")
 
-def enrich_lowtax(rows:list[dict[str,Any]], max_lookups:int=40)->dict[str,Any]:
+def enrich_lowtax(rows:list[dict[str,Any]], max_lookups:int=20)->dict[str,Any]:
+    """Enrich only the strongest candidates, with concurrent owner lookups."""
     cache={}; lookups=0; matched=0
+    jobs={}
     for row in rows:
         owner=owner_search_name(str(row.get("owner_name") or "")); parcel=row.get("parcel_id")
-        if not owner or not parcel: continue
-        if owner not in cache:
-            if lookups>=max_lookups: break
+        if not owner or not parcel or owner in jobs: continue
+        if len(jobs)>=max_lookups: break
+        jobs[owner]=row
+    with ThreadPoolExecutor(max_workers=min(6, max(1, len(jobs)))) as pool:
+        futures={pool.submit(search_owner, owner, 0): owner for owner in jobs}
+        for future in as_completed(futures):
+            owner=futures[future]
             try:
-                payload=search_owner(owner,0)
+                payload=future.result()
                 cache[owner]=list(payload.get("Results") or [])
             except Exception:
                 cache[owner]=[]
-            lookups+=1
-        match=find_matching_record(cache[owner],parcel)
+    for row in rows:
+        owner=owner_search_name(str(row.get("owner_name") or "")); parcel=row.get("parcel_id")
+        if not owner or not parcel: continue
+        match=find_matching_record(cache.get(owner, []),parcel)
         if match:
             row.update(to_enrichment(match)); matched+=1
         else:
             row["lowtax_match_status"]="not_found"
-    return {"lookups":lookups,"matched":matched,"cache_names":len(cache)}
+    return {"lookups":len(jobs),"matched":matched,"cache_names":len(cache)}
 
 def research_data(limit:int,city:str|None,sort:str="best",strategy:str="all",min_score:int=0,property_type:str="all",owner_type:str="all",min_years:int=0,tax_signal:str="all",absentee:str="all"):
     where="1=1"
@@ -50,7 +59,7 @@ def research_data(limit:int,city:str|None,sort:str="best",strategy:str="all",min
     pool=max(200,min(1000,limit*10)); rows=query_parcels_pool(where=where,pages=(pool+199)//200,page_size=200)
     first=second_pass(to_canonical(rows)); candidates=list(first.get("leads",[]))
     candidates.sort(key=lambda x:(-num(x.get("lead_score")),-num(x.get("confidence")),x.get("property_address","")))
-    enrichment=enrich_lowtax(candidates[:max(50,limit*2)])
+    enrichment=enrich_lowtax(candidates[:max(25,limit)])
     result=second_pass(candidates); leads=list(result.get("leads",[]))
     def ok(x):
         score=num(x.get("lead_score")); reasons=" ".join(x.get("screening_reasons") or []).lower()

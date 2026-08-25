@@ -11,8 +11,11 @@ class BrowserEngineError(RuntimeError):
     pass
 
 
+DEFAULT_WORKER_URL = "https://wholesale-ai-agent.onrender.com"
+
+
 def local_browser_available() -> bool:
-    return bool(os.getenv("BROWSER_WORKER_URL") and os.getenv("BROWSER_WORKER_TOKEN"))
+    return bool(os.getenv("BROWSER_WORKER_TOKEN"))
 
 
 def browse(
@@ -24,10 +27,10 @@ def browse(
     timeout_s: float = 45.0,
 ) -> Dict[str, Any]:
     """Run deterministic browser actions on the self-hosted browser worker."""
-    worker = os.getenv("BROWSER_WORKER_URL")
+    worker = os.getenv("BROWSER_WORKER_URL", DEFAULT_WORKER_URL)
     token = os.getenv("BROWSER_WORKER_TOKEN")
-    if not worker or not token:
-        raise BrowserEngineError("BROWSER_WORKER_URL/BROWSER_WORKER_TOKEN are not configured")
+    if not token:
+        raise BrowserEngineError("BROWSER_WORKER_TOKEN is not configured")
 
     payload = {
         "url": url,
